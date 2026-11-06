@@ -6,6 +6,7 @@ import { getEffectiveRecordingDurationMs } from "@/lib/mediaTiming";
 import {
 	DEFAULT_WEBCAM_QUALITY,
 	getWebcamQualityConfig,
+	WEBCAM_QUALITY_PRESETS,
 	type WebcamQualityPreset,
 } from "@/lib/webcamQuality";
 import { acquireBrowserScreenCapture, isCapturePermissionDismissed } from "./browserScreenCapture";
@@ -400,6 +401,12 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 	const mixingContext = useRef<AudioContext | null>(null);
 	const chunks = useRef<Blob[]>([]);
 	const webcamRecordingDiscarded = useRef(false);
+	// Whether the currently prepared webcam recorder has had .start() called on
+	// it. MediaRecorder.state === "inactive" is ambiguous - it's also true the
+	// instant an error implicitly stops a recorder, before its onstop event
+	// has actually fired - so this is the only reliable way to tell "never
+	// started, onstop will never fire" apart from "started and mid-stop".
+	const webcamRecorderStarted = useRef(false);
 	const startTime = useRef<number>(0);
 	const webcamStartTime = useRef<number | null>(null);
 	const webcamTimeOffsetMs = useRef(0);
@@ -939,9 +946,15 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			return result ?? null;
 		}
 
-		if (recorder.state !== "inactive") {
-			recorder.stop();
+		if (webcamRecorderStarted.current) {
+			// Started - defer entirely to its onstop (which may already be queued
+			// if state flipped to "inactive" via an error ahead of that event).
+			// Resolving here too could race a new recording that starts once this
+			// promise settles, before the real cleanup has actually finished.
+			if (recorder.state !== "inactive") recorder.stop();
 		} else if (pending && webcamStopResolver.current) {
+			// Never started - no onstop will ever fire for it.
+			void window.electronAPI.discardWebcamChunkStream();
 			webcamStopResolver.current(resolvedWebcamPath.current);
 			webcamStopResolver.current = null;
 		}
@@ -1025,6 +1038,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			const webcamFileName = `${RECORDING_FILE_PREFIX}${sessionTimestamp}${WEBCAM_SUFFIX}${getVideoExtensionForMimeType(mimeType)}`;
 			resolvedWebcamPath.current = null;
 			webcamRecordingDiscarded.current = false;
+			webcamRecorderStarted.current = false;
 			webcamStopPromise.current = new Promise((resolve) => {
 				webcamStopResolver.current = resolve;
 			});
@@ -1042,31 +1056,60 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 
 			webcamRecorder.current = recorder;
 			let hasWrittenChunk = false;
+			let appendFailed = false;
+			let recorderErrored = false;
 			// Chunks arrive every RECORDER_TIMESLICE_MS; appends are chained so they
 			// land on disk in order instead of racing each other over IPC.
 			let writeQueue: Promise<void> = Promise.resolve();
+			// If disk/IPC falls behind the recorder, chunks would otherwise pile up
+			// in this chain (each holding its ArrayBuffer in memory) without bound
+			// - the exact unbounded-growth problem writing chunks to disk, instead
+			// of an in-memory Blob[], was meant to avoid. Cap the backlog and treat
+			// hitting the cap as a failure (discarded in onstop) rather than
+			// silently dropping chunks into a corrupt file.
+			const MAX_PENDING_WEBCAM_CHUNKS = 20;
+			let pendingChunkCount = 0;
 			recorder.ondataavailable = (event) => {
 				if (!event.data || event.data.size === 0) return;
+				if (pendingChunkCount >= MAX_PENDING_WEBCAM_CHUNKS) {
+					appendFailed = true;
+					return;
+				}
 				hasWrittenChunk = true;
+				pendingChunkCount++;
 				const chunk = event.data;
 				writeQueue = writeQueue
 					.then(() => chunk.arrayBuffer())
 					.then((buffer) => window.electronAPI.appendWebcamChunk(buffer))
-					.then(() => undefined)
+					.then((result) => {
+						if (!result.success) appendFailed = true;
+					})
 					.catch((error) => {
+						appendFailed = true;
 						console.error("Failed to append webcam chunk:", error);
+					})
+					.finally(() => {
+						pendingChunkCount--;
 					});
 			};
 			recorder.onerror = () => {
-				void window.electronAPI.discardWebcamChunkStream();
-				webcamStopResolver.current?.(null);
-				webcamStopResolver.current = null;
+				// Don't discard/resolve here: MediaRecorder fires `stop` right after
+				// `error`, and onstop below does the real cleanup (awaits writeQueue,
+				// then discards). Resolving early would let a new recording start
+				// before that cleanup finishes and race the single active-stream
+				// slot on the main process.
+				recorderErrored = true;
 			};
 			recorder.onstop = async () => {
 				try {
 					await writeQueue;
 
-					if (webcamRecordingDiscarded.current || !hasWrittenChunk) {
+					if (
+						webcamRecordingDiscarded.current ||
+						!hasWrittenChunk ||
+						appendFailed ||
+						recorderErrored
+					) {
 						await window.electronAPI.discardWebcamChunkStream();
 						webcamStopResolver.current?.(null);
 						return;
@@ -1126,6 +1169,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 		if (recorder && recorder.state === "inactive") {
 			webcamStartTime.current = Date.now();
 			recorder.start(RECORDER_TIMESLICE_MS);
+			webcamRecorderStarted.current = true;
 		}
 	}, []);
 
@@ -1144,6 +1188,11 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 		}
 
 		recordingSessionTimestamp.current = Date.now();
+		// Let a previous cancelled/stopped webcam recorder's onstop fully settle
+		// before resetting the shared clock it reads its own duration from -
+		// otherwise its duration ends up computed against the new session's
+		// timestamps instead of its own.
+		if (webcamStopPromise.current) await webcamStopPromise.current;
 		resetRecordingClock(recordingSessionTimestamp.current);
 		await prepareWebcamRecorder();
 
@@ -1532,7 +1581,9 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				if (result.webcamDeviceId) {
 					setWebcamDeviceId(result.webcamDeviceId);
 				}
-				if (result.webcamQuality) {
+				if (
+					WEBCAM_QUALITY_PRESETS.some((preset) => preset.id === result.webcamQuality)
+				) {
 					setWebcamQualityState(result.webcamQuality as WebcamQualityPreset);
 				}
 			}
@@ -2425,19 +2476,33 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 	}, [markRecordingResumed, paused, recording, resumeMicFallbackRecorder]);
 
 	const cancelRecording = useCallback(() => {
-		recordingStartGeneration.current += 1;
+		// Bail out before touching anything shared (the generation counter,
+		// webcam refs) when there's no active recording to cancel - otherwise a
+		// stray/duplicate call (e.g. from a control that hasn't noticed the
+		// recording already stopped) can bump the generation counter and abort
+		// an unrelated recording that's in the middle of starting, or discard
+		// webcam state that belongs to it. cancelRecordingStart is the dedicated
+		// path for cancelling a recording that's still starting up.
 		if (!recording) return;
+		recordingStartGeneration.current += 1;
 		setPaused(false);
 		markRecordingResumed(Date.now());
 
 		// Discard webcam recording regardless of recording mode
 		webcamRecordingDiscarded.current = true;
-		if (webcamRecorder.current && webcamRecorder.current.state !== "inactive") {
-			webcamRecorder.current.stop();
+		if (webcamRecorder.current && webcamRecorderStarted.current) {
+			// Started (even if an error already flipped state to "inactive" ahead
+			// of its onstop event) - its onstop will fire and do the real cleanup,
+			// resolving the pending stop promise. Don't resolve/discard here too,
+			// or a new recording could start before that cleanup finishes.
+			if (webcamRecorder.current.state !== "inactive") webcamRecorder.current.stop();
 		} else {
-			// No recorder to fire onstop (e.g. cancelled before it was ready) -
-			// clean up any chunk file already started on disk.
+			// Never started (cancelled before beginWebcamCapture ran) - no onstop
+			// will ever fire, so resolve the pending stop promise and clean up the
+			// chunk file ourselves instead of waiting for an event that won't come.
 			void window.electronAPI.discardWebcamChunkStream();
+			webcamStopResolver.current?.(null);
+			webcamStopResolver.current = null;
 		}
 		webcamRecorder.current = null;
 		webcamStartTime.current = null;
